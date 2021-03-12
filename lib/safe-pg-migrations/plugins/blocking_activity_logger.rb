@@ -28,16 +28,37 @@ module SafePgMigrations
       add_column remove_column add_foreign_key remove_foreign_key change_column_default change_column_null create_table
     ].each do |method|
       define_method method do |*args, &block|
-        log_blocking_queries { super(*args, &block) }
+        log_blocking_queries_when_locked { super(*args, &block) }
+      end
+    end
+
+    def add_index(table_name, column_name, **options)
+      if options[:algorithm] == :concurrently
+        log_blocking_queries { super(table_name, column_name, **options) }
+      else
+        super(table_name, column_name, **options)
       end
     end
 
     private
 
     def log_blocking_queries
-      delay_before_logging =
-        SafePgMigrations.config.safe_timeout - SafePgMigrations.config.blocking_activity_logger_margin
+      blocking_queries_retriever_thread =
+        Thread.new do
+          sleep delay_before_logging
+          loop do
+            queries = SafePgMigrations.alternate_connection.query(SELECT_BLOCKING_QUERIES_SQL % raw_connection.backend_pid)
+            log_queries(queries)
+            sleep SafePgMigrations.config.retry_delay
+          end
+        end
 
+      yield
+
+      blocking_queries_retriever_thread.kill
+    end
+
+    def log_blocking_queries_when_locked
       blocking_queries_retriever_thread =
         Thread.new do
           sleep delay_before_logging
@@ -59,6 +80,11 @@ module SafePgMigrations
 
       raise if queries.nil?
 
+      log_queries queries
+      raise
+    end
+
+    def log_queries(queries)
       if queries.empty?
         SafePgMigrations.say 'Could not find any blocking query.', true
       else
@@ -74,13 +100,15 @@ module SafePgMigrations
         )
         SafePgMigrations.say '', true
       end
-
-      raise
     end
 
     def format_start_time(start_time, reference_time = Time.now)
       duration = (reference_time - start_time).round
       "transaction started #{duration} #{'second'.pluralize(duration)} ago"
+    end
+    
+    def delay_before_logging
+      @_delay_before_logging ||= SafePgMigrations.config.safe_timeout - SafePgMigrations.config.blocking_activity_logger_margin
     end
   end
 end
